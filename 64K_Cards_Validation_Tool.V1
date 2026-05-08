@@ -1,0 +1,875 @@
+import tkinter as tk
+from tkinter import messagebox, Toplevel, ttk
+from PIL import Image, ImageTk
+from smartcard.System import readers
+from smartcard.CardConnection import CardConnection
+from datetime import datetime, time
+import os
+import shutil
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+from openpyxl.drawing.image import Image as XLImage
+import sqlite3
+
+# -------- SETTINGS --------
+MASTER_EXCEL_PATHS = [
+    r"E:\CMS-QA-F43 64 Cards Validation Sheet.xlsx",
+    r"D:\CMS-QA-F43 64 Cards Validation Sheet.xlsx"
+]
+
+MASTER_EXCEL = None
+for path in MASTER_EXCEL_PATHS:
+    if os.path.exists(path):
+        MASTER_EXCEL = path
+        break
+
+if MASTER_EXCEL is None:
+    fallback_path = "CMS-QA-F43 64 Cards Validation Sheet.xlsx"
+    if os.path.exists(fallback_path):
+        MASTER_EXCEL = fallback_path
+    else:
+        MASTER_EXCEL = MASTER_EXCEL_PATHS[0]
+
+OUTPUT_DIR = r"E:\ICCID_Logs"
+DATABASE_DIR = r"E:\ICCID_Database"
+START_ROW = 7
+CARD_COLUMN    = 'E'
+BARCODE_COLUMN = 'G'
+OPERATOR_COLUMN= 'H'
+TIME_COLUMN    = 'F'
+MAX_READINGS   = 64
+
+try:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+except Exception:
+    OUTPUT_DIR = r"D:\ICCID_Logs"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+try:
+    os.makedirs(DATABASE_DIR, exist_ok=True)
+except Exception:
+    DATABASE_DIR = r"D:\ICCID_Database"
+    os.makedirs(DATABASE_DIR, exist_ok=True)
+# --------------------------
+
+# -------- Logo: D drive first --------
+LOGO_PATHS = [r"D:\logo.png", r"E:\logo.png", "logo.png"]
+
+def find_logo():
+    for p in LOGO_PATHS:
+        if os.path.exists(p):
+            return p
+    return None
+
+# -------- Protocol order: T1 first avoids 0x00000057 on T0 --------
+PROTOCOL_ORDER = [
+    CardConnection.T1_protocol,
+    CardConnection.T0_protocol | CardConnection.T1_protocol,
+    CardConnection.T0_protocol,
+    CardConnection.RAW_protocol,
+]
+
+# -------- APDU sequences (original proven logic, unchanged) --------
+APDU_SEQUENCES = [
+    # Sequence 1: MF select -> EF_ICCID select -> Read Binary
+    [
+        [0x00, 0xA4, 0x00, 0x00, 0x02, 0x3F, 0x00],
+        [0x00, 0xA4, 0x00, 0x00, 0x02, 0x2F, 0xE2],
+        [0x00, 0xB0, 0x00, 0x00, 0x0A],
+    ],
+    # Sequence 2: AID select -> EF_ICCID select -> Read Binary
+    [
+        [0x00, 0xA4, 0x04, 0x00, 0x0A,
+         0xA0, 0x00, 0x00, 0x00, 0x87,
+         0x10, 0x02, 0xFF, 0x86, 0xFF, 0xFF],
+        [0x00, 0xA4, 0x00, 0x04, 0x02, 0x2F, 0xE2],
+        [0x00, 0xB0, 0x00, 0x00, 0x0A],
+    ],
+    # Sequence 3: Direct EF_ICCID select -> Read Binary
+    [
+        [0x00, 0xA4, 0x00, 0x04, 0x02, 0x2F, 0xE2],
+        [0x00, 0xB0, 0x00, 0x00, 0x0A],
+    ],
+]
+
+
+class ICCIDReaderApp:
+    # 400 ms poll — detects card in under half a second
+    POLL_INTERVAL = 400
+
+    def __init__(self, master):
+        self.master = master
+        self.master.title("ROSMERTA_ajit")
+        self.master.geometry("1000x750")
+        self.master.config(bg="#d9edf7")
+
+        # Cached protocol — set after first successful connect.
+        # Eliminates re-negotiation delay for every subsequent card.
+        self._cached_protocol = None
+
+        self._set_window_icon()
+        self.init_database()
+
+        # State
+        self.reader_var         = tk.StringVar()
+        self.last_iccid         = ""
+        self.last_barcode       = ""
+        self.output_file        = None
+        self.waiting_for_barcode= False
+        self.scanner_buffer     = ""
+        self.card_mode          = tk.StringVar(value="Half")
+
+        # Personalization + operator fields
+        self.customer_name = ""
+        self.product_name  = ""
+        self.circle        = ""
+        self.batch_no      = ""
+        self.sof_no        = ""
+        self.batch_qty     = ""
+        self.me_batch_no   = ""
+        self.operator_name = ""
+        self.machine_name  = ""
+
+        # ---- Header ----
+        header_frame = tk.Frame(master, bd=2, relief="solid",
+                                padx=10, pady=5, bg="orange")
+        header_frame.pack(pady=10, fill="x")
+
+        logo_path = find_logo()
+        if logo_path:
+            try:
+                logo_img = Image.open(logo_path).resize((80, 40), Image.LANCZOS)
+                self._header_logo = ImageTk.PhotoImage(logo_img)
+                tk.Label(header_frame, image=self._header_logo,
+                         bg="orange").pack(side="left", padx=8)
+            except Exception:
+                pass
+
+        tk.Label(header_frame, text="64 Cards & Barcode Validation Tool",
+                 font=("Arial", 20, "bold"), bg="orange").pack(side="left")
+
+        tk.Label(master, text="Created by Ajitkumar",
+                 font=("Arial", 9), anchor="se",
+                 bg="#d9edf7").place(relx=1.0, rely=1.0, x=-5, y=-5, anchor="se")
+
+        # ---- Reader selection ----
+        frame_reader = tk.Frame(master, bg="#d9edf7")
+        frame_reader.pack(pady=6, fill="x")
+        tk.Label(frame_reader, text="Select Reader:",
+                 bg="#d9edf7", font=("Arial", 11)).pack(side="left", padx=5)
+        self.reader_menu = tk.OptionMenu(frame_reader, self.reader_var, ())
+        self.reader_menu.pack(side="left", padx=5)
+        tk.Button(frame_reader, text="Refresh Readers",
+                  command=self.populate_readers).pack(side="left", padx=5)
+
+        # ---- Mode selection ----
+        mode_frame = tk.Frame(master, bg="#d9edf7")
+        mode_frame.pack(pady=6)
+        tk.Label(mode_frame, text="Select Mode:",
+                 bg="#d9edf7", font=("Arial", 11)).pack(side="left", padx=6)
+        tk.Radiobutton(mode_frame, text="Quarter Card",
+                       variable=self.card_mode, value="Quarter",
+                       bg="#d9edf7",
+                       command=self._on_mode_change).pack(side="left", padx=8)
+        tk.Radiobutton(mode_frame, text="Half Card",
+                       variable=self.card_mode, value="Half",
+                       bg="#d9edf7",
+                       command=self._on_mode_change).pack(side="left", padx=8)
+        tk.Radiobutton(mode_frame, text="USB Scanner",
+                       variable=self.card_mode, value="USB",
+                       bg="#d9edf7",
+                       command=self._on_mode_change).pack(side="left", padx=8)
+
+        # ---- Control buttons ----
+        tk.Button(master, text="Enter Personalization Info",
+                  command=self.open_personalization_window,
+                  bg="#cfe2f3", font=("Arial", 12, "bold")).pack(pady=5)
+        tk.Button(master, text="Enter Operator & Machine Info",
+                  command=self.open_operator_window,
+                  bg="#f9cb9c", font=("Arial", 12, "bold")).pack(pady=5)
+
+        instr = ("Workflow: For Half-Card: place full card -> ICCID auto-read"
+                 " -> scan half-card barcode.\n"
+                 "USB Scanner mode: scan barcode anytime.")
+        tk.Label(master, text=instr, bg="#d9edf7",
+                 font=("Arial", 10, "italic")).pack(pady=4)
+
+        # ---- Barcode entry ----
+        self.barcode_frame = tk.Frame(master, bg="#d9edf7")
+        self.barcode_frame.pack(pady=6)
+        tk.Label(self.barcode_frame, text="Barcode:",
+                 bg="#d9edf7", font=("Arial", 11)).pack(side="left", padx=5)
+        self.barcode_entry = tk.Entry(self.barcode_frame, font=("Arial", 15))
+        self.barcode_entry.pack(side="left", padx=5)
+        self.barcode_entry.bind("<Return>", self._entry_return)
+
+        # ---- Read ICCID button ----
+        self.read_button = tk.Button(master, text="Read ICCID",
+                                     command=self.read_iccid,
+                                     font=("Arial", 11, "bold"), bg="#dff0d8")
+        self.read_button.pack(pady=8)
+
+        # ---- Output labels ----
+        self.output_label = tk.Label(master, text="", font=("Arial", 14),
+                                     fg="blue", bg="#d9edf7",
+                                     wraplength=950, justify="left")
+        self.output_label.pack(pady=6)
+
+        self.barcode_display = tk.Label(master, text="Last Barcode: None",
+                                        font=("Arial", 13, "bold"),
+                                        fg="green", bg="#d9edf7")
+        self.barcode_display.pack(pady=4)
+
+        # ---- Table view ----
+        frame_table = tk.Frame(master, bg="#d9edf7")
+        frame_table.pack(pady=10, fill="both", expand=True)
+
+        columns = ("Sr.No", "ICCID", "Barcode", "Operator", "Time", "Status")
+        self.tree = ttk.Treeview(frame_table, columns=columns,
+                                 show="headings", height=18)
+        for col in columns:
+            if col == "Sr.No":
+                self.tree.heading(col, text=col)
+                self.tree.column(col, width=60, anchor="center")
+            elif col == "Status":
+                self.tree.heading(col, text=col)
+                self.tree.column(col, width=100, anchor="center")
+            else:
+                self.tree.heading(col, text=col)
+                self.tree.column(col, width=180, anchor="center")
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(frame_table, orient="vertical",
+                                  command=self.tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        self.tree.tag_configure('match',    background='#90EE90')
+        self.tree.tag_configure('mismatch', background='#FFB6C1')
+
+        self.populate_readers()
+        self.previous_card_present = None
+        self.poll_card()
+
+        self.master.bind_all("<Key>", self._global_key_handler)
+        self.load_table_from_excel()
+        self._on_mode_change()
+
+    # ==================================================================
+    # Window icon
+    # ==================================================================
+
+    def _set_window_icon(self):
+        logo_path = find_logo()
+        if logo_path:
+            try:
+                icon_img = Image.open(logo_path).resize((32, 32), Image.LANCZOS)
+                self._window_icon = ImageTk.PhotoImage(icon_img)
+                self.master.iconphoto(True, self._window_icon)
+            except Exception as e:
+                print(f"Could not set window icon: {e}")
+
+    # ==================================================================
+    # SPEED: Protocol helpers — cached connection
+    # ==================================================================
+
+    def _connect_fast(self, reader_obj):
+        """
+        Try cached protocol first (zero negotiation overhead after first card).
+        Fall back to full negotiation only when cache misses or is stale.
+        Returns a connected CardConnection or raises Exception.
+        """
+        # ---- Fast path: cached protocol ----
+        if self._cached_protocol is not None:
+            conn = reader_obj.createConnection()
+            try:
+                conn.connect(self._cached_protocol)
+                return conn                          # instant — no loop
+            except Exception:
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
+                self._cached_protocol = None         # stale — clear it
+
+        # ---- Slow path: negotiate once, then cache winner ----
+        last_exc = Exception("All protocols failed.")
+        for protocol in PROTOCOL_ORDER:
+            conn = reader_obj.createConnection()
+            try:
+                conn.connect(protocol)
+                self._cached_protocol = protocol     # cache for next card
+                return conn
+            except Exception as e:
+                last_exc = e
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
+        raise last_exc
+
+    def _get_reader_obj(self):
+        name = self.reader_var.get()
+        if not name:
+            return None
+        try:
+            return next(r for r in readers() if str(r) == name)
+        except Exception:
+            return None
+
+    # ==================================================================
+    # Database
+    # ==================================================================
+
+    def init_database(self):
+        db_path = os.path.join(DATABASE_DIR, "iccid_data.db")
+        self.conn   = sqlite3.connect(db_path)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS iccid_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sr_no INTEGER, iccid TEXT, barcode TEXT,
+                operator TEXT, timestamp TEXT, status TEXT,
+                customer_name TEXT, product_name TEXT, circle TEXT,
+                batch_no TEXT, sof_no TEXT, batch_qty TEXT,
+                me_batch_no TEXT, machine_name TEXT,
+                shift TEXT, created_date TEXT
+            )
+        ''')
+        self.conn.commit()
+
+    def save_to_database(self, sr_no, iccid, barcode, operator,
+                         timestamp, status):
+        try:
+            self.cursor.execute('''
+                INSERT INTO iccid_records
+                (sr_no, iccid, barcode, operator, timestamp, status,
+                 customer_name, product_name, circle, batch_no, sof_no,
+                 batch_qty, me_batch_no, machine_name, shift, created_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                sr_no, iccid, barcode, operator, timestamp, status,
+                self.customer_name, self.product_name, self.circle,
+                self.batch_no, self.sof_no, self.batch_qty,
+                self.me_batch_no, self.machine_name, self.get_shift(),
+                datetime.now().strftime("%Y-%m-%d")
+            ))
+            self.conn.commit()
+        except Exception as e:
+            print(f"Database error: {e}")
+
+    # ==================================================================
+    # Mode change
+    # ==================================================================
+
+    def _on_mode_change(self):
+        mode = self.card_mode.get()
+        if mode == "USB":
+            try:
+                self.barcode_frame.pack(pady=6)
+            except Exception:
+                pass
+            self.waiting_for_barcode = False
+            self.output_label.config(text="USB Scanner mode: scan barcode anytime.")
+        elif mode == "Half":
+            self.barcode_entry.delete(0, tk.END)
+            try:
+                self.barcode_frame.pack(pady=6)
+            except Exception:
+                pass
+            self.waiting_for_barcode = False
+            self.output_label.config(
+                text="Half Card mode: read ICCID first, then scan half-card barcode.")
+        else:  # Quarter
+            try:
+                self.barcode_frame.pack_forget()
+            except Exception:
+                pass
+            self.waiting_for_barcode = False
+            self.output_label.config(
+                text="Quarter Card mode: ICCID only (no barcode).")
+
+    # ==================================================================
+    # Global keyboard / scanner
+    # ==================================================================
+
+    def _global_key_handler(self, event):
+        mode = self.card_mode.get()
+        if mode == "Quarter":
+            return
+        if mode == "Half" and not self.waiting_for_barcode:
+            return
+        if len(event.keysym) > 1 and not event.char:
+            return
+        char = event.char
+        if not char:
+            return
+        if char in ("\r", "\n"):
+            data = self.scanner_buffer.strip()
+            self.scanner_buffer = ""
+            if data:
+                self._process_scanner_data(data)
+            return
+        if 32 <= ord(char) <= 126:
+            self.scanner_buffer += char
+            if len(self.scanner_buffer) > 500:
+                self.scanner_buffer = self.scanner_buffer[-500:]
+
+    def _entry_return(self, event=None):
+        data = self.barcode_entry.get().strip()
+        self.barcode_entry.delete(0, tk.END)
+        if data:
+            self._process_scanner_data(data)
+
+    def _process_scanner_data(self, data):
+        mode = self.card_mode.get()
+        if mode == "Half" and not self.waiting_for_barcode:
+            self.output_label.config(
+                text="Please read ICCID before scanning barcode.")
+            return
+        if mode == "Quarter":
+            self.output_label.config(text="Barcode ignored in Quarter Card mode.")
+            return
+        self.last_barcode = data
+        self.barcode_display.config(text=f"Last Barcode: {data}")
+        if not self.output_file or not os.path.exists(self.output_file):
+            if not self.batch_no or not self.sof_no:
+                self.output_label.config(
+                    text="Set Batch No and SOF No before saving.")
+                return
+            self.create_new_excel()
+        self.save_to_excel(data, mode="Barcode")
+        self.output_label.config(text=f"Barcode {data} saved.")
+        if mode == "Half":
+            self.waiting_for_barcode = False
+
+    # ==================================================================
+    # SPEED: Card polling (400 ms, cached protocol)
+    # ==================================================================
+
+    def populate_readers(self):
+        try:
+            reader_list = readers()
+        except Exception:
+            reader_list = []
+        self.reader_var.set('')
+        self.reader_menu['menu'].delete(0, 'end')
+        if not reader_list:
+            messagebox.showwarning("Warning", "No smart card readers found.")
+            return
+        for r in reader_list:
+            self.reader_menu['menu'].add_command(
+                label=str(r),
+                command=tk._setit(self.reader_var, str(r)))
+        self.reader_var.set(str(reader_list[0]))
+
+    def poll_card(self):
+        """
+        Poll at 400 ms using cached protocol — almost zero overhead
+        once the first card has been read.
+        """
+        reader_obj  = self._get_reader_obj()
+        card_present = False
+
+        if reader_obj:
+            conn = None
+            try:
+                conn = self._connect_fast(reader_obj)
+                card_present = True
+            except Exception:
+                card_present = False
+            finally:
+                if conn:
+                    try:
+                        conn.disconnect()
+                    except Exception:
+                        pass
+
+        if card_present and self.previous_card_present is not True:
+            self.output_label.config(text="Card detected. Reading ICCID...")
+            if not self.output_file or not os.path.exists(self.output_file):
+                if self.batch_no and self.sof_no:
+                    self.create_new_excel()
+            self.read_iccid()
+        elif not card_present and self.previous_card_present is not False:
+            self.output_label.config(
+                text=f"Card removed. Last ICCID: {self.last_iccid}")
+
+        self.previous_card_present = card_present
+        self.master.after(self.POLL_INTERVAL, self.poll_card)
+
+    # ==================================================================
+    # SPEED: ICCID read — single connection, original APDU logic restored
+    # ==================================================================
+
+    def read_iccid(self):
+        """
+        Connect ONCE with cached/best protocol, then run the original
+        proven APDU loop on that single connection.
+
+        Original logic (restored):
+          For each sequence, transmit every command.
+          The first command that returns resp + SW 9000 IS the ICCID data
+          (the READ BINARY command always returns data; SELECT commands return
+          an empty resp, so resp is falsy for them — this naturally skips them
+          and captures only the READ result).
+        """
+        reader_obj = self._get_reader_obj()
+        if not reader_obj:
+            self.output_label.config(text="Please select a reader.")
+            return
+
+        iccid = None
+
+        # ---- Attempt 1: single connection, cached protocol (FAST) ----
+        conn = None
+        try:
+            conn = self._connect_fast(reader_obj)
+            iccid = self._run_apdu_sequences(conn)
+        except Exception:
+            iccid = None
+        finally:
+            if conn:
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
+
+        # ---- Attempt 2: full protocol re-negotiation (rare fallback) ----
+        if not iccid:
+            self._cached_protocol = None            # clear stale cache
+            for protocol in PROTOCOL_ORDER:
+                conn = None
+                try:
+                    conn = reader_obj.createConnection()
+                    conn.connect(protocol)
+                    iccid = self._run_apdu_sequences(conn)
+                    if iccid:
+                        self._cached_protocol = protocol   # cache winner
+                        break
+                except Exception:
+                    pass
+                finally:
+                    if conn:
+                        try:
+                            conn.disconnect()
+                        except Exception:
+                            pass
+
+        # ---- Process result ----
+        if iccid:
+            # Swap nibbles — standard ICCID BCD encoding
+            iccid = ''.join([iccid[i + 1] + iccid[i]
+                             for i in range(0, len(iccid), 2)])
+            self.last_iccid = iccid
+            self.output_label.config(text=f"ICCID: {iccid} ✅")
+
+            if not self.output_file or not os.path.exists(self.output_file):
+                if self.batch_no and self.sof_no:
+                    self.create_new_excel()
+                else:
+                    self.output_label.config(
+                        text=f"ICCID: {iccid} ✅  |  "
+                             "Enter personalization info to save.")
+
+            if self.output_file and os.path.exists(self.output_file):
+                self.save_to_excel(iccid, mode="ICCID")
+
+            mode = self.card_mode.get()
+            if mode == "Half":
+                self.waiting_for_barcode = True
+                try:
+                    self.barcode_entry.focus()
+                except Exception:
+                    pass
+            else:
+                self.waiting_for_barcode = False
+        else:
+            self.output_label.config(
+                text="Failed to read ICCID. Check card placement and retry.")
+
+    def _run_apdu_sequences(self, conn):
+        """
+        Original proven APDU logic — runs on an already-connected conn.
+        Returns raw ICCID hex string (before nibble swap) or None.
+
+        Logic: iterate sequences; within each sequence transmit every command.
+        SELECT commands return empty resp → skipped.
+        READ BINARY returns data with SW 9000 → captured as ICCID.
+        First successful read wins.
+        """
+        for seq in APDU_SEQUENCES:
+            for cmd in seq:
+                try:
+                    resp, sw1, sw2 = conn.transmit(cmd)
+                    if resp and sw1 == 0x90 and sw2 == 0x00:
+                        # Got data back — this is the READ BINARY response
+                        return ''.join([f"{b:02X}" for b in resp])
+                except Exception:
+                    break          # this sequence failed; try next one
+        return None
+
+    # ==================================================================
+    # Excel operations
+    # ==================================================================
+
+    def create_new_excel(self):
+        global MASTER_EXCEL
+        if not os.path.exists(MASTER_EXCEL):
+            for path in MASTER_EXCEL_PATHS:
+                if os.path.exists(path):
+                    MASTER_EXCEL = path
+                    break
+            if not os.path.exists(MASTER_EXCEL):
+                messagebox.showerror(
+                    "Error",
+                    f"Master Excel not found!\nTried:\n"
+                    f"{chr(10).join(MASTER_EXCEL_PATHS)}")
+                return
+        if not self.batch_no or not self.sof_no:
+            messagebox.showerror(
+                "Error",
+                "Perso Batch No and SOF No required before creating Excel.")
+            return
+        filename = (f"{self.batch_no}_{self.sof_no}_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        self.output_file = os.path.join(OUTPUT_DIR, filename)
+        shutil.copy(MASTER_EXCEL, self.output_file)
+        self.update_excel_header()
+        self.add_logo_to_excel()
+        self.load_table_from_excel()
+
+    def update_excel_header(self):
+        wb = load_workbook(self.output_file)
+        ws = wb.active
+        ws["H3"] = self.customer_name
+        ws["E4"] = f"{self.product_name} {self.circle}"
+        ws["E5"] = self.batch_no
+        ws["E3"] = self.sof_no
+        ws["H4"] = self.batch_qty
+        ws["H5"] = self.me_batch_no
+        ws["C7"] = self.machine_name
+        ws["D7"] = self.get_shift()
+        wb.save(self.output_file)
+
+    def add_logo_to_excel(self):
+        logo_path = find_logo()
+        if logo_path:
+            try:
+                wb = load_workbook(self.output_file)
+                ws = wb.active
+                img = XLImage(logo_path)
+                img.width  = 100
+                img.height = 50
+                img.anchor = 'B2'
+                ws.add_image(img)
+                wb.save(self.output_file)
+                print(f"Logo added to Excel from: {logo_path}")
+            except Exception as e:
+                print(f"Error adding logo to Excel: {e}")
+        else:
+            print("logo.png not found on D:\\, E:\\ or current directory.")
+
+    def get_shift(self):
+        now = datetime.now().time()
+        if time(7, 0) <= now < time(15, 0):
+            return "A Shift"
+        elif time(15, 0) <= now < time(23, 0):
+            return "B Shift"
+        else:
+            return "C Shift"
+
+    def save_to_excel(self, value, mode="ICCID"):
+        if not self.output_file or not os.path.exists(self.output_file):
+            self.output_label.config(text="No Excel file to save data.")
+            return
+
+        wb  = load_workbook(self.output_file)
+        ws  = wb.active
+        col = CARD_COLUMN if mode == "ICCID" else BARCODE_COLUMN
+
+        row_to_write = None
+        for row in range(START_ROW, START_ROW + MAX_READINGS):
+            if ws[f"{col}{row}"].value == value:
+                row_to_write = row
+                break
+        if row_to_write is None:
+            for row in range(START_ROW, START_ROW + MAX_READINGS):
+                if not ws[f"{col}{row}"].value:
+                    row_to_write = row
+                    break
+        if row_to_write is None:
+            wb.save(self.output_file)
+            self.create_new_excel()
+            wb = load_workbook(self.output_file)
+            ws = wb.active
+            row_to_write = START_ROW
+
+        ws[f"{col}{row_to_write}"]           = value
+        timestamp                             = datetime.now().strftime(
+                                                   "%d-%m-%Y, %H:%M:%S")
+        ws[f"{TIME_COLUMN}{row_to_write}"]    = timestamp
+        operator_name = (self.operator_name
+                         if self.operator_name else "Operator Not Set")
+        ws[f"{OPERATOR_COLUMN}{row_to_write}"] = operator_name
+
+        if self.card_mode.get() == "Half":
+            self.apply_color_highlighting(ws, row_to_write)
+
+        wb.save(self.output_file)
+
+        sr_no      = row_to_write - START_ROW + 1
+        iccid_val  = (ws[f"{CARD_COLUMN}{row_to_write}"].value
+                      if mode == "Barcode" else value)
+        barcode_val= (value if mode == "Barcode"
+                      else ws[f"{BARCODE_COLUMN}{row_to_write}"].value)
+        status = ""
+        if self.card_mode.get() == "Half" and iccid_val and barcode_val:
+            status = ("MATCH"
+                      if str(iccid_val).strip() == str(barcode_val).strip()
+                      else "MISMATCH")
+
+        self.save_to_database(sr_no, iccid_val, barcode_val,
+                              operator_name, timestamp, status)
+        self.load_table_from_excel()
+        self._scroll_to_row_with_value(row_to_write)
+
+    def apply_color_highlighting(self, ws, row_number):
+        iccid_val   = ws[f"{CARD_COLUMN}{row_number}"].value
+        barcode_val = ws[f"{BARCODE_COLUMN}{row_number}"].value
+        if iccid_val and barcode_val:
+            color = ("90EE90"
+                     if str(iccid_val).strip() == str(barcode_val).strip()
+                     else "FFB6C1")
+            fill = PatternFill(start_color=color, end_color=color,
+                               fill_type="solid")
+            ws[f"{CARD_COLUMN}{row_number}"].fill  = fill
+            ws[f"{BARCODE_COLUMN}{row_number}"].fill = fill
+
+    def load_table_from_excel(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        if not self.output_file or not os.path.exists(self.output_file):
+            return
+        try:
+            wb = load_workbook(self.output_file, data_only=True)
+            ws = wb.active
+        except Exception:
+            return
+        for row in range(START_ROW, START_ROW + MAX_READINGS):
+            iccid_val   = ws[f"{CARD_COLUMN}{row}"].value
+            barcode_val = ws[f"{BARCODE_COLUMN}{row}"].value
+            op_val      = ws[f"{OPERATOR_COLUMN}{row}"].value
+            time_val    = ws[f"{TIME_COLUMN}{row}"].value
+            if iccid_val or barcode_val:
+                sr_no      = row - START_ROW + 1
+                iccid_str  = str(iccid_val)   if iccid_val   else ""
+                barcode_str= str(barcode_val) if barcode_val else ""
+                op_str     = str(op_val)      if op_val      else ""
+                time_str   = str(time_val)    if time_val    else ""
+                status = ""
+                tag    = ""
+                if self.card_mode.get() == "Half" and iccid_val and barcode_val:
+                    if str(iccid_val).strip() == str(barcode_val).strip():
+                        status, tag = "MATCH",    "match"
+                    else:
+                        status, tag = "MISMATCH", "mismatch"
+                if tag:
+                    self.tree.insert("", "end",
+                                     values=(sr_no, iccid_str, barcode_str,
+                                             op_str, time_str, status),
+                                     tags=(tag,))
+                else:
+                    self.tree.insert("", "end",
+                                     values=(sr_no, iccid_str, barcode_str,
+                                             op_str, time_str, status))
+
+    def _scroll_to_row_with_value(self, row_number):
+        sr_no = row_number - START_ROW + 1
+        for iid in self.tree.get_children():
+            vals = self.tree.item(iid, "values")
+            if vals and int(vals[0]) == sr_no:
+                self.tree.see(iid)
+                self.tree.selection_set(iid)
+                self.master.after(
+                    600, lambda i=iid: self.tree.selection_remove(i))
+                break
+
+    # ==================================================================
+    # Personalization & operator windows
+    # ==================================================================
+
+    def open_personalization_window(self):
+        top = Toplevel(self.master)
+        top.title("Personalization Info")
+        labels = ["Customer Name", "Product Name", "Circle",
+                  "Batch No", "SOF No", "Batch Qty", "ME Batch No"]
+        entries = {}
+        for i, text in enumerate(labels):
+            tk.Label(top, text=text + ":").grid(
+                row=i, column=0, padx=5, pady=5, sticky="w")
+            entry = tk.Entry(top, width=35)
+            entry.grid(row=i, column=1, padx=5, pady=5)
+            entries[text] = entry
+
+        def save_personalization():
+            self.customer_name = entries["Customer Name"].get().strip()
+            self.product_name  = entries["Product Name"].get().strip()
+            self.circle        = entries["Circle"].get().strip()
+            self.batch_no      = entries["Batch No"].get().strip()
+            self.sof_no        = entries["SOF No"].get().strip()
+            self.batch_qty     = entries["Batch Qty"].get().strip()
+            self.me_batch_no   = entries["ME Batch No"].get().strip()
+            if not self.batch_no or not self.sof_no:
+                messagebox.showerror("Error", "Batch No and SOF No required.")
+                return
+            if self.output_file:
+                self.update_excel_header()
+                self.load_table_from_excel()
+            top.destroy()
+
+        tk.Button(top, text="Save", command=save_personalization,
+                  bg="lightgreen").grid(
+            row=len(labels), column=0, columnspan=2, pady=10)
+
+    def open_operator_window(self):
+        top = Toplevel(self.master)
+        top.title("Operator & Machine Info")
+        tk.Label(top, text="Validation Operator Name:").grid(
+            row=0, column=0, padx=5, pady=5, sticky="w")
+        op_entry = tk.Entry(top, width=35)
+        op_entry.grid(row=0, column=1, padx=5, pady=5)
+        tk.Label(top, text="Machine Name:").grid(
+            row=1, column=0, padx=5, pady=5, sticky="w")
+        mach_entry = tk.Entry(top, width=35)
+        mach_entry.grid(row=1, column=1, padx=5, pady=5)
+
+        def save_operator():
+            self.operator_name = op_entry.get().strip()
+            self.machine_name  = mach_entry.get().strip()
+            if not self.operator_name or not self.machine_name:
+                messagebox.showwarning("Warning", "Both fields required.")
+                return
+            if self.output_file:
+                wb = load_workbook(self.output_file)
+                ws = wb.active
+                ws["C7"] = self.machine_name
+                ws["D7"] = self.get_shift()
+                wb.save(self.output_file)
+                self.load_table_from_excel()
+            top.destroy()
+
+        tk.Button(top, text="Save", command=save_operator,
+                  bg="lightgreen").grid(
+            row=2, column=0, columnspan=2, pady=10)
+
+    def __del__(self):
+        if hasattr(self, 'conn'):
+            self.conn.close()
+
+
+# -------- Run --------
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ICCIDReaderApp(root)
+    root.mainloop()
